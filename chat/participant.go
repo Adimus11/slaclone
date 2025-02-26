@@ -98,6 +98,13 @@ func (p *participant) handleEvents(ctx context.Context) func() error {
 		for {
 			select {
 			case <-ctx.Done():
+				p.conn.WriteJSON(objects.Event{
+					Event: objects.SystemMessage,
+					Payload: objects.SystemEvent{
+						UserID:  p.ID,
+						Message: "participant disconnected by server",
+					},
+				})
 				return nil
 			case event, ok := <-eventReceiver:
 				if !ok {
