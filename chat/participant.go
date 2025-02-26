@@ -189,6 +189,12 @@ func (p *participant) handleSendMessageRequest(request objects.ActionRequest) er
 		}
 		return nil
 	}
+	if message.Message == "" {
+		if err := p.sendError(request.Action, "message is empty"); err != nil {
+			return err
+		}
+		return nil
+	}
 	if err := p.chatService.SendMessage(p, message); err != nil {
 		if err := p.sendError(request.Action, fmt.Sprintf("failed to send message, due: %s", err.Error())); err != nil {
 			return err
