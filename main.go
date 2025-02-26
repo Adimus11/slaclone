@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	"golang.org/x/sync/errgroup"
 )
 
 var upgrader = websocket.Upgrader{
@@ -59,13 +58,9 @@ func serveWs(ctx context.Context, chatService *chat.Chat) func(w http.ResponseWr
 		}
 
 		participant := chat.NewParticipant(conn, chatService)
-		defer participant.Close()
-
-		errGroup, ctx := errgroup.WithContext(ctx)
-		participant.HandleMessages(ctx, errGroup)
-		participant.HandleEvents(ctx, errGroup)
-		if err := errGroup.Wait(); err != nil {
+		if err := participant.Run(ctx); err != nil {
 			log.Println("participant error:", err)
 		}
+		log.Printf("participant exited: %s\n", participant.ID)
 	}
 }

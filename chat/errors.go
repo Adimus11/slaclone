@@ -1,6 +1,8 @@
 package chat
 
-import "errors"
+import (
+	"errors"
+)
 
 var (
 	ErrRoomExists               = errors.New("room already exists")

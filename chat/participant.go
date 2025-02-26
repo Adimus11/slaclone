@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"practice-run/chat/objects"
+	"practice-run/guard"
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
@@ -13,33 +14,57 @@ import (
 )
 
 type participant struct {
-	ChatService   *Chat
-	Conn          *websocket.Conn
-	ID            uuid.UUID
-	eventReceiver chan objects.Event
+	ID          uuid.UUID
+	chatService *Chat
+	conn        *websocket.Conn
+	eventChan   *guard.ChanGuard[objects.Event]
 }
 
 func NewParticipant(conn *websocket.Conn, chatService *Chat) *participant {
 	return &participant{
-		ChatService:   chatService,
-		Conn:          conn,
-		ID:            uuid.New(),
-		eventReceiver: make(chan objects.Event),
+		ID:          uuid.New(),
+		chatService: chatService,
+		conn:        conn,
+		eventChan:   guard.NewSafeChan[objects.Event](),
 	}
 }
 
-func (p *participant) HandleMessages(ctx context.Context, errGroup *errgroup.Group) {
-	errGroup.Go(func() error {
-		getRequestChan, errChan, close := p.handleWSInput()
-		defer close()
+func (p *participant) EventChan() *guard.ChanGuard[objects.Event] {
+	return p.eventChan
+}
 
+func (p *participant) Run(ctx context.Context) error {
+	defer p.close()
+	errGroup, ctx := errgroup.WithContext(ctx)
+	errGroup.Go(p.handleWS(ctx))
+	errGroup.Go(p.handleEvents(ctx))
+	return errGroup.Wait()
+}
+
+func (p *participant) close() {
+	p.eventChan.Close()
+	p.chatService.DisconnectParticipant(p)
+	p.conn.Close()
+}
+
+func (p *participant) handleWS(ctx context.Context) func() error {
+	return func() error {
 		for {
 			select {
 			case <-ctx.Done():
 				return nil
-			case err := <-errChan:
-				return err
-			case request := <-getRequestChan:
+			default:
+				var request objects.ActionRequest
+				if err := p.conn.ReadJSON(&request); err != nil {
+					log.Printf("failed to read message from participant %s: %v", p.ID, err)
+					if websocket.IsUnexpectedCloseError(err) {
+						return err
+					}
+					if err := p.sendError(objects.NotParsable, fmt.Sprintf("failed to read message, due: %s", err.Error())); err != nil {
+						return err
+					}
+					continue
+				}
 				switch request.Action {
 				case objects.CreateRoom:
 					if err := p.handleCreateRoomRequest(request); err != nil {
@@ -64,16 +89,21 @@ func (p *participant) HandleMessages(ctx context.Context, errGroup *errgroup.Gro
 				}
 			}
 		}
-	})
+	}
 }
 
-func (p *participant) HandleEvents(ctx context.Context, errGroup *errgroup.Group) {
-	errGroup.Go(func() error {
+func (p *participant) handleEvents(ctx context.Context) func() error {
+	eventReceiver := p.eventChan.Receiver()
+	return func() error {
 		for {
 			select {
 			case <-ctx.Done():
 				return nil
-			case event := <-p.eventReceiver:
+			case event, ok := <-eventReceiver:
+				if !ok {
+					log.Printf("participant %s stopped handling messages due channel closed", p.ID)
+					return nil
+				}
 				switch event.Event {
 				case objects.MessageReceived:
 					_, ok := event.Payload.(objects.MessagePayload)
@@ -81,7 +111,7 @@ func (p *participant) HandleEvents(ctx context.Context, errGroup *errgroup.Group
 						log.Printf("invalid payload type (%T) for event %s", event.Payload, objects.MessageReceived)
 						continue
 					}
-					if err := p.Conn.WriteJSON(event); err != nil {
+					if err := p.conn.WriteJSON(event); err != nil {
 						log.Printf("failed to write message to participant %s: %v", p.ID, err)
 						return err
 					}
@@ -90,13 +120,7 @@ func (p *participant) HandleEvents(ctx context.Context, errGroup *errgroup.Group
 				}
 			}
 		}
-	})
-}
-
-func (p *participant) Close() {
-	p.ChatService.DisconnectParticipant(p)
-	close(p.eventReceiver)
-	p.Conn.Close()
+	}
 }
 
 func (p *participant) handleCreateRoomRequest(request objects.ActionRequest) error {
@@ -107,7 +131,7 @@ func (p *participant) handleCreateRoomRequest(request objects.ActionRequest) err
 		}
 		return nil
 	}
-	if err := p.ChatService.CreateRoom(p, room); err != nil {
+	if err := p.chatService.CreateRoom(p, room); err != nil {
 		if err := p.sendError(request.Action, fmt.Sprintf("failed to create room, due: %s", err.Error())); err != nil {
 			return err
 		}
@@ -124,7 +148,7 @@ func (p *participant) handleJoinRoomRequest(request objects.ActionRequest) error
 		}
 		return nil
 	}
-	if err := p.ChatService.JoinRoom(p, room); err != nil {
+	if err := p.chatService.JoinRoom(p, room); err != nil {
 		if err := p.sendError(request.Action, fmt.Sprintf("failed to join room, due: %s", err.Error())); err != nil {
 			return err
 		}
@@ -141,7 +165,7 @@ func (p *participant) handleLeaveRoomRequest(request objects.ActionRequest) erro
 		}
 		return nil
 	}
-	if err := p.ChatService.LeaveRoom(p, room); err != nil {
+	if err := p.chatService.LeaveRoom(p, room); err != nil {
 		if err := p.sendError(request.Action, fmt.Sprintf("failed to leave room, due: %s", err.Error())); err != nil {
 			return err
 		}
@@ -158,7 +182,7 @@ func (p *participant) handleSendMessageRequest(request objects.ActionRequest) er
 		}
 		return nil
 	}
-	if err := p.ChatService.SendMessage(p, message); err != nil {
+	if err := p.chatService.SendMessage(p, message); err != nil {
 		if err := p.sendError(request.Action, fmt.Sprintf("failed to send message, due: %s", err.Error())); err != nil {
 			return err
 		}
@@ -176,7 +200,7 @@ func (p *participant) sendSuccess(actionType objects.Action, reason string) erro
 }
 
 func (p *participant) sendResponse(actionType objects.Action, reason string, success bool) error {
-	if err := p.Conn.WriteJSON(objects.ActionResponse{
+	if err := p.conn.WriteJSON(objects.ActionResponse{
 		Action:          actionType,
 		ResponseMessage: reason,
 		Succeeded:       success,
@@ -187,31 +211,4 @@ func (p *participant) sendResponse(actionType objects.Action, reason string, suc
 		}
 	}
 	return nil
-}
-
-func (p *participant) handleWSInput() (<-chan objects.ActionRequest, <-chan error, func()) {
-	getRequestChan := make(chan objects.ActionRequest)
-	errChan := make(chan error)
-	go func() {
-		for {
-			var request objects.ActionRequest
-			if err := p.Conn.ReadJSON(&request); err != nil {
-				log.Printf("failed to read message from participant %s: %v", p.ID, err)
-				if websocket.IsUnexpectedCloseError(err) {
-					errChan <- err
-					return
-				}
-				if err := p.sendError(objects.NotParsable, fmt.Sprintf("failed to read message, due: %s", err.Error())); err != nil {
-					errChan <- err
-					return
-				}
-			}
-			getRequestChan <- request
-		}
-	}()
-
-	return getRequestChan, errChan, func() {
-		close(getRequestChan)
-		close(errChan)
-	}
 }

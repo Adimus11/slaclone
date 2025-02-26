@@ -2,6 +2,7 @@ package chat
 
 import (
 	"practice-run/chat/objects"
+	"practice-run/guard"
 	"sync"
 
 	"github.com/google/uuid"
@@ -9,14 +10,12 @@ import (
 
 type room struct {
 	mu           sync.Mutex
-	participants map[uuid.UUID]chan<- objects.Event
+	participants map[uuid.UUID]*guard.ChanGuard[objects.Event]
 }
 
 func newRoom(participant *participant) *room {
 	return &room{
-		participants: map[uuid.UUID]chan<- objects.Event{
-			participant.ID: participant.eventReceiver,
-		},
+		participants: map[uuid.UUID]*guard.ChanGuard[objects.Event]{participant.ID: participant.EventChan()},
 	}
 }
 
@@ -31,7 +30,7 @@ func (r *room) addParticipant(participant *participant) error {
 	if ok {
 		return ErrParticipantAlreadyInRoom
 	}
-	r.participants[participant.ID] = participant.eventReceiver
+	r.participants[participant.ID] = participant.EventChan()
 	return nil
 }
 
@@ -57,10 +56,10 @@ func (r *room) broadcastMessage(message objects.MessagePayload) error {
 		if id == message.From {
 			continue
 		}
-		ch <- objects.Event{
+		ch.Send(objects.Event{
 			Event:   objects.MessageReceived,
 			Payload: message,
-		}
+		})
 	}
 	return nil
 }
