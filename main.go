@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -26,12 +27,21 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	http.HandleFunc("/ws", serveWs(ctx, chatService))
 
+	serverCheck := make(chan struct{})
 	server := &http.Server{Addr: ":8080"}
 	go func() {
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			close(serverCheck)
 			log.Fatalf("ListenAndServe(): %v", err)
 		}
 	}()
+
+	select {
+	case <-serverCheck:
+		return
+	case <-time.After(time.Second):
+		fmt.Println("Server started at :8080")
+	}
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, os.Interrupt)
